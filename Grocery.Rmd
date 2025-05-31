@@ -1,0 +1,863 @@
+---
+title: "EDA Grocery Data Analysis"
+author: "Nicole Rouleau"
+date: "5/15/2025"
+output: 
+  html_document:
+    theme: cosmo
+    toc: yes
+    toc_float:
+      collapsed: true
+---
+# Introduction
+
+Exploratory Data Analysis (EDA) is a type of an analysis used to gain a deeper knowledge of a dataset. This is done through both statistical and visualization means in order to find patterns and relationships within the data. 
+
+
+# Data
+
+The data utilized here is the "Grocery Sales Dataset" created by Andrex Ibiza. This is a relational data set containing seven different interconnected tables on grocery sales, customers, locations, products, and employees.The data was gathered over a four-month period in early 2018 containing just under 100,000 unique customers and just over 6.5 million unique sales. While conducted in a short period it contains vast data across 100 cities (within the United States). Groceries have been placed into 11 different categories with there being a total of just over 450 unique products. 
+
+## Libraries
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+#Data Manipulation
+library(data.table) 
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+library(tools)
+
+#Modeling
+library(tidymodels)
+library(xgboost)
+
+#Plotting
+library(factoextra)
+library(viridis)
+library(cluster)
+library(scales)
+```
+
+## Import Data
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+# Create directory
+dir.create(path.expand("~/.kaggle"), showWarnings = FALSE)
+file.copy("path/to/kaggle.json", path.expand("~/.kaggle/kaggle.json"))
+Sys.chmod(path.expand("~/.kaggle/kaggle.json"), mode = "600")
+
+# Dataset path
+dataset <- "andrexibiza/grocery-sales-dataset"
+
+# Download dataset to current working directory
+system(paste("kaggle datasets download -d", dataset))
+
+# Unzip the downloaded file
+unzip("grocery-sales-dataset.zip", exdir = "grocery-sales-dataset")
+
+# List extracted files
+list.files()
+```
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+# Define the folder where the files are extracted
+data_folder <- "grocery-sales-dataset"
+
+# Get full file paths for all CSV files
+file_paths <- list.files(data_folder, pattern = "\\.csv$", full.names = TRUE)
+
+# Create clean variable names from file names
+file_names <- file_path_sans_ext(basename(file_paths))
+file_names <- make.names(file_names)  # ensures valid R names
+
+# Read each file and assign it to the global environment
+walk2(file_paths, file_names, ~ {
+  message("Loading: ", .y)
+  df <- fread(.x)
+  assign(.y, df, envir = .GlobalEnv)
+})
+
+# Take a look at the data
+head(sales)
+head(categories)
+head(customers)
+head(cities)
+head(employees)
+head(products)
+head(countries)
+```
+
+* At first glance we can see that the Total Price is empty in the Sales data frame, we will need to add this in
+* We can also note that the Products data frame 'CategoryID' does not align properly with the Catgeories data frame, we will remedy this as well
+
+## Cleaning Data
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+# Load correct map (manually created)
+correct_products <- fread("corrected_products_grocery.csv")
+
+# Join to fix CategoryID
+products[, CategoryID := NULL]
+setkey(products, ProductID)
+setkey(correct_products, ProductID)
+products <- correct_products[products]  # left join
+
+# CategoryName for CategoryID 10 should be Household, not Snails, we can edit that here as well
+categories$CategoryName[10] <- "Household"
+
+# Rename columns for clarity between Employees, Customers. Cities, and Countries
+employees <- employees %>%
+  rename(
+   EmployeeFirstName = FirstName,
+   EmployeeMI = MiddleInitial,
+   EmployeeLastName = LastName,
+   EmployeeBD = BirthDate,
+   EmployeeGender = Gender,
+   EmployeeHireDate = HireDate,
+   EmployeeCityID = CityID,
+  )
+
+customers <- customers %>%
+  rename(
+    CustomerFirstName = FirstName,
+    CustomerMI = MiddleInitial,
+    CustomerLastName = LastName,
+    CustomerAddress = Address,
+    CustomerCityID = CityID,
+  )
+
+cities <- cities %>%
+  rename(CityID = CityID, CityName = CityName)
+
+countries <- countries %>%
+  rename(CountryID = CountryID, CountryName = CountryName)
+```
+
+Let's combine our data frames into one usable table.
+
+```{r, message=FALSE, warning=FALSE}
+# Join Cities & Countries
+cities_full <- cities %>%
+  left_join(countries, by = "CountryID")
+
+# Join employee location
+employees_full <- employees %>%
+  left_join(cities_full, by = c("EmployeeCityID" = "CityID")) %>%
+  rename(
+    EmployeeCityName = CityName,
+    EmployeeCountryName = CountryName,
+    EmployeeCountryCode = CountryCode,
+    EmployeeZipcode = Zipcode,
+    EmployeeCountryID = CountryID
+  )
+
+# Join customer location
+customers_full <- customers %>%
+  left_join(cities_full, by = c("CustomerCityID" = "CityID")) %>%
+  rename(
+    CustomerCityName = CityName,
+    CustomerCountryName = CountryName,
+    CustomerCountryCode = CountryCode,
+    CustomerZipcode = Zipcode,
+    CustomerCountryID = CountryID
+  )
+
+# Final Join
+sales_full <- sales %>%
+  rename(EmployeeID = SalesPersonID) %>%
+  left_join(employees_full, by = "EmployeeID") %>%
+  left_join(products,       by = "ProductID") %>%
+  left_join(customers_full, by = "CustomerID") %>%
+  left_join(categories,     by = "CategoryID")
+
+# Utilize the Price set in the Products data frame to create the missing Total Price and replace the zeros while also taking into account the Discount (we will assume the Discount is per item here and not per transaction, since it is not stated)
+sales_full[, TotalPrice := Quantity * Price - Quantity * Discount]
+
+#Clean up the date to a Y/M/D format
+sales_full$SalesDate <- as.Date(sales_full$SalesDate, format = "%Y-%m-%d")
+sales_full$ModifyDate <- as.Date(sales_full$ModifyDate, format = "%Y-%m-%d")
+sales_full$EmployeeBD <- as.Date(sales_full$EmployeeBD, format = "%Y-%m-%d")
+sales_full$EmployeeHireDate <- as.Date(sales_full$EmployeeHireDate, format = "%Y-%m-%d")
+
+head(sales_full, 10)
+```
+
+# Analysis
+
+## 1. Descriptive Analytics
+
+```{r, message=FALSE, warning=FALSE}
+# Total Sales by Category
+sales_desc_cat <- sales_full[, .(total_sales_by_category_desc = sum(TotalPrice)), 
+                             by = CategoryName][order(-total_sales_by_category_desc)]
+head(sales_desc_cat)
+
+sales_asc_cat <- sales_full[, .(total_sales_by_category_asc = sum(TotalPrice)), 
+                             by = CategoryName][order(total_sales_by_category_asc)]
+head(sales_asc_cat)
+
+# Total Sales by Product
+sales_desc_product <- sales_full[, .(total_sales_by_product_desc = sum(TotalPrice)), 
+                             by = ProductName][order(-total_sales_by_product_desc)]
+head(sales_desc_product)
+
+
+sales_asc_product <- sales_full[, .(total_sales_by_product_asc = sum(TotalPrice)), 
+                             by = ProductName][order(total_sales_by_product_asc)]
+head(sales_asc_product)
+
+# Total Sales over the total 4 months
+sales_full %>%
+  group_by(SalesDate) %>%
+  summarise(daily_sales = sum(TotalPrice)) %>%
+  ggplot(aes(SalesDate, daily_sales)) +
+  geom_line(color = "darkgrey") +
+  geom_hline(aes(yintercept = mean(daily_sales)), linetype = "dashed", color = "red") +
+  ylim(3.35e+07, 3.5e+07) +
+  labs(title = "Total Sales Over Time",
+       x = "Month", y = "# of Sales") +
+  theme_minimal()
+
+```
+
+Insights:
+
+* Produce is the highest selling category, followed by Beverages and Grain
+* Cereals is the lowest selling category, followed Poultry and Shellfish
+* Bread (Calabrese Baguette) is the highest selling product, followed by Shrimp (31/40) and Tia Maria (a beverage)
+  * This is interesting as shrimp is high selling in products but overall shellfish is one of the lowest selling categories
+  * Grain is a high selling category, this lines up with Bread being a top selling product
+* Bread Crumbs (Japanese Style) is the lowest selling product, followed by Apricot (Halves) and Pastry (Raisin Muffin Mini).
+* Overall sales seem to be fairly even throughout the January to the start of May. While there are dips and spikes we can see the red-dashed mean line is fairly even between it all. There was little sale variation over the 4 months, with January looking to have the least variation. 
+
+## 2. Customer-Sales Behavior
+
+```{r, message=FALSE, warning=FALSE}
+# Total spend per customer
+total_spend <- sales_full[, .(customer_total_spend = sum(TotalPrice, na.rm = TRUE)), 
+                             by = CustomerID][order(-customer_total_spend)]
+head(total_spend)
+
+# Frequency of purchases
+sales_full %>%
+  group_by(SalesDate) %>%
+  summarise(purchase_count = n()) %>%
+  ggplot(aes(SalesDate, purchase_count)) +
+  geom_line(color = "darkgrey") +
+  geom_hline(aes(yintercept = mean(purchase_count)), linetype = "dashed", color = "red") +
+  ylim(51000, 53000) +
+  labs(title = "Frequency of Purchases Over Time",
+       x = "Date", y = "Number of Purchases") +
+  theme_minimal()
+  
+# Calculate Basket Size Per Transaction
+basket_size <- sales_full[, .(items_per_transaction = sum(Quantity, na.rm = TRUE)), 
+                             by = SalesID]
+
+# Boxplot
+ggplot(basket_size, aes(x = "", y = items_per_transaction)) +
+  geom_boxplot(fill = "#21908CFF") +
+  coord_flip() +
+  labs(
+    title = "Distribution of Basket Size",
+    y = "Items per Transaction",
+    x = ""
+  ) +
+  theme_minimal()
+```
+
+Insights:
+
+* The customers spending the most, are spending well into the $130,000 range within the 4 months
+* Frequency of customer transactions over the 4 moths varies quite a bit
+  * Customer purchases are much lower in January and begin to have larger spikes as the months go on leading to a higher mean
+* 50% of customers purchase anywhere between about 7 to 19 items per transaction, with the average being about 13 items per transaction 
+
+## 3. Customer-Product Behavior
+
+```{r, message=FALSE, warning=FALSE}
+# How much each customer spent on each product
+# Combined grouped summary
+customer_product_summary <- sales_full[
+  , .(
+    total_quantity = sum(Quantity, na.rm = TRUE),
+    total_spent = sum(TotalPrice, na.rm = TRUE),
+    n_purchases = .N
+  ),
+  by = .(CustomerID, ProductID, ProductName)
+]
+
+# Sort once by spend
+customer_product_summary1 <- customer_product_summary %>%
+  arrange(desc(total_spent))
+
+# Sort once by quantity
+customer_product_summary2 <- customer_product_summary %>%
+  arrange(desc(total_quantity))
+
+# Preview
+head(customer_product_summary1)
+head(customer_product_summary2)
+
+# Cluster Customers by Spending
+# Customer Summary
+customer_summary <- sales_full[
+  , .(
+    total_spent = sum(TotalPrice, na.rm = TRUE),
+    avg_basket_size = mean(Quantity, na.rm = TRUE),
+    n_transactions = n_distinct(SalesID)
+  ),
+  by = .(CustomerID)
+]
+
+# Scale data
+customer_scaled <- scale(customer_summary[, .(total_spent, avg_basket_size)])
+
+# K-means
+set.seed(123)
+kmeans_result <- kmeans(customer_scaled, centers = 3)
+customer_summary$cluster <- as.factor(kmeans_result$cluster)
+
+# Visualize
+ggplot(customer_summary, aes(x = total_spent, y = avg_basket_size, color = cluster)) +
+  geom_point(alpha = 0.7) +
+  scale_color_viridis_d(option = "D") +
+  labs (
+    title = "Customer Clusters by Spending and Basket Size",
+    x = "Total Spent",
+    y = "Average Basket Size"
+  ) +
+  theme_minimal()
+
+# Analyze Cluster
+customer_summary %>%
+  group_by(cluster) %>%
+  summarise(
+    avg_spent = mean(total_spent),
+    avg_basket = mean(avg_basket_size),
+    count = n()
+  )
+```
+
+Insights:
+
+* Customers are spending the most on Beer, Paper Towels and Mushrooms
+  * Beverages and produce is are top selling categories, this aligns well
+* Customers are purchasing the most of Paper Towels, Sherry, and Onions
+  * We can see that customers who purchase the highest quantity of items are not necessarily the highest spenders but generally the more quantity or larger basket size, the higher the total spend. 
+    * Our highest sales categories we see again with beverages and produce
+
+## 4. Salesperson Effectiveness
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+# Sales by Employees Summary
+sales_by_employee <- sales_full[
+  , .(
+    total_sales = sum(TotalPrice, na.rm = TRUE),
+    total_quantity = sum(Quantity, na.rm = TRUE),
+    num_transactions = .N,
+    avg_discount = mean(Discount, na.rm = TRUE),
+    unique_customers = uniqueN(CustomerID),
+    unique_products = uniqueN(ProductID),
+    avg_transaction_value = mean(TotalPrice, na.rm = TRUE)
+  ),
+  by = .(EmployeeID, EmployeeFirstName, EmployeeLastName)
+][order(-total_sales)]
+head(sales_by_employee)
+
+# Monthly Sales per Employee
+# Create a SalesMonth column
+sales_full[, SalesMonth := format(as.Date(SalesDate), "%Y-%m")]
+
+# Summarize monthly sales per employee
+monthly_performance <- sales_full[
+  , .(monthly_sales = sum(TotalPrice, na.rm = TRUE)),
+  by = .(EmployeeID, SalesMonth, EmployeeFirstName, EmployeeLastName)
+]
+head(monthly_performance)
+
+# Top Employees
+sales_by_employee <- sales_by_employee %>%
+  arrange(desc(total_sales)) %>%
+  mutate(rank = row_number(),
+         percentile = percent_rank(total_sales))
+
+ggplot(sales_by_employee, aes(x = reorder(paste(EmployeeFirstName, EmployeeLastName), total_sales), y = percentile)) +
+  geom_col(fill = "#3B528BFF") +
+  coord_flip() +
+  labs(
+    title = "Salesperson Rank Percentiles by Total Sales",
+    x = "Employee",
+    y = "Percentile Rank"
+  ) +
+  theme_minimal()
+
+# Performance by City
+employee_city_performance <- sales_full[
+  , .(city_sales = sum(TotalPrice, na.rm = TRUE)),
+  by = .(EmployeeID, EmployeeCityID, EmployeeCityName)
+]
+head(employee_city_performance)
+
+# Performance by Age & Tenure
+sales_full[, AgeAtSale := as.integer(floor((SalesDate - EmployeeBD) / 365.25))]
+sales_full[, TenureAtSale := as.integer(floor((SalesDate - EmployeeHireDate) / 365.25))]
+
+employee_performance <- sales_full[
+  , .(
+    total_sales = sum(TotalPrice, na.rm = TRUE),
+    total_quantity = sum(Quantity, na.rm = TRUE),
+    n_transactions = uniqueN(TransactionNumber),
+    avg_discount = mean(Discount, na.rm = TRUE),
+    unique_customers = uniqueN(CustomerID),
+    unique_products = uniqueN(ProductID),
+    avg_transaction_value = mean(TotalPrice, na.rm = TRUE),
+    avg_age_at_sale = mean(AgeAtSale, na.rm = TRUE),
+    avg_tenure_at_sale = mean(TenureAtSale, na.rm = TRUE)
+  ),
+  by = .(EmployeeID, EmployeeFirstName, EmployeeLastName)
+][order(-total_sales)]
+head(employee_performance)
+
+employee_performance[, AgeGroup := cut(
+  avg_age_at_sale, breaks = c(0, 29, 39, 49, 59, Inf),
+  labels = c("<30", "30-39", "40-49", "50-59", "60+"),
+  right = FALSE
+)]
+
+employee_performance[, TenureGroup := cut(
+  avg_tenure_at_sale, breaks = c(0, 2, 4, 6, 8, 10, Inf),
+  labels = c("<2 yrs", "2-4 yrs", "4-6 yrs", "6-8 yrs", "8-10 yrs", "10+ yrs"),
+  right = FALSE
+)]
+
+ggplot(employee_performance, aes(x = AgeGroup, y = total_sales)) +
+  geom_col(fill = "#357BA2FF") +
+  labs(
+    title = "Total Sales by Employee Age Group",
+    x = "Age Group at Time of Sale",
+    y = "Total Sales"
+  ) +
+  theme_minimal()
+
+ggplot(employee_performance, aes(x = AgeGroup, y = total_sales)) +
+  geom_boxplot(fill = "#357BA2FF") +
+  labs(
+    title = "Distribution of Total Sales by Age Group",
+    x = "Age Group",
+    y = "Total Sales"
+  ) +
+  theme_minimal()
+
+ggplot(employee_performance, aes(x = TenureGroup, y = total_sales)) +
+  geom_col(fill = "#3B528BFF") +
+  labs(
+    title = "Total Sales by Employee Tenure Group",
+    x = "Tenure Group at Time of Sale",
+    y = "Total Sales"
+  ) +
+  theme_minimal()
+```
+
+Insights:
+
+* Devon Brewer, Shelby Riddle, and Katina Marks made the most sales giving out average discounts of .029 with an average transaction value of about $660
+* Ranking the salespeople, we see that Devon Brewer is bringing in the most with Seth Franco  selling the least
+  * Bernard Moody is doing better than 50% his coworkers and 50% worse than the rest
+* The employees were from all different cities. With Baltimore, Tuscon and Anchorage leading in sales
+* Age seems to play factor, with those in their 50s making much more sales than their peers
+  * When looking at the boxplot it seems that even the mean of the data shifts quite a bit with those under 30 making well below their peers and those in the 50s age range doing much better
+* Looking at tenure, not surprisingly, the more tenured the employee, the stronger their individual sales are
+
+## 5. Geographic Trends
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+# Customer Sales by City
+sales_by_city <- sales_full [
+  , .(city_sales = sum(TotalPrice)),
+  by = .(CustomerCityID, CustomerCityName)][order(-city_sales)]
+head(sales_by_city)
+
+# Sales per customer 
+sales_per_customer <- sales_full[
+  , .(total_sales = sum(TotalPrice), num_customers = uniqueN(CustomerID)),
+  by = .(CustomerCityID, CustomerCityName)
+][
+  , sales_per_customer := total_sales / num_customers
+][order(-sales_per_customer)]
+head(sales_per_customer)
+
+# Trends Over Time
+monthly_city_sales <- sales_full[
+  , .(monthly_sales = sum(TotalPrice)),
+  by = .(CustomerCityName, SalesMonth)
+]
+
+top_cities <- monthly_city_sales[, .(total = sum(monthly_sales)), by = CustomerCityName][
+  order(-total)
+][1:5, CustomerCityName]
+filtered_data <- monthly_city_sales[CustomerCityName %in% top_cities]
+
+ggplot(filtered_data, aes(x = SalesMonth, y = monthly_sales, color = CustomerCityName, group = CustomerCityName)) +
+  geom_line(linewidth = 1) +
+  scale_color_viridis_d(option = "D") +
+  labs(title = "Monthly Sales by Top Cities", x = "Month", y = "Sales", color = "City") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+# Customer Density v Sales
+customer_density_sales <- sales_full[
+  , .(
+    total_sales = sum(TotalPrice),
+    unique_customers = uniqueN(CustomerID),
+    avg_sales_per_customer = sum(TotalPrice) / uniqueN(CustomerID)
+  ),
+  by = .(CustomerCityName)][order(-unique_customers)]
+head(customer_density_sales)
+
+# Average Transaction Value by City
+transaction_value <- sales_full[
+  , .(avg_transaction_value = mean(TotalPrice, na.rm = TRUE)),
+  by = CustomerCityName][order(-avg_transaction_value)]
+head(transaction_value)
+
+# Basket Size by City
+basket_size_city <- sales_full[
+  , .(avg_basket_size = mean(Quantity, na.rm = TRUE)),
+  by = CustomerCityName][order(-avg_basket_size)]
+head(basket_size_city)
+
+# Product Category Sales by City
+category_by_city <- sales_full[
+  , .(total_sales = sum(TotalPrice)),
+  by = .(CustomerCityName, CategoryName)][order(-total_sales)]
+
+top_cities <- category_by_city[, .(city_sales = sum(total_sales)), by = CustomerCityName][
+  order(-city_sales)
+][1:10, CustomerCityName]
+
+category_by_city_filtered <- category_by_city[CustomerCityName %in% top_cities]
+
+ggplot(category_by_city_filtered, aes(x = reorder(CustomerCityName, total_sales), y = total_sales, fill = CategoryName)) +
+  geom_col(position = "stack") +
+  coord_flip() +
+  scale_fill_viridis_d(option = "D", name = "Category") +
+  labs(
+    title = "Sales by Product Category and Top Cities",
+    x = "City",
+    y = "Total Sales"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Insights:
+
+* The highest customer sales are in Tucson, Jackson, and Sacramento
+  * Tucson was where one of the employees had very high sales 
+* The highest average sales per customer are in Jackson, San Antonio, and Jacksonville
+* Generally, cities seem to follow very similar paths in how sales were distributed from beginning of January to end of April
+  * Sales began very high and had large dip at the start of April, crashing down
+* More customers per city does not necessarily equate to more sales in that city due to the average transaction value being high in some cases
+* The cities with the highest average transaction value are: Jackson, Arlington, and Albuquerque
+* The cities with the highest average basket size (average number of items per transaction) are: Jackson, Arlington, and Jacksonville
+* All Top Cities share the same Top Product Categories of: Beverages and Produce
+
+## 6. Category/ Product Analysis
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+sales_full[, SalesMonth := format(SalesDate, "%Y-%m")]
+
+# Products Monthly Trends
+category_monthly <- sales_full[
+  , .(monthly_sales = sum(TotalPrice)),
+  by = .(CategoryName, SalesMonth)
+]
+
+ggplot(category_monthly, aes(x = SalesMonth, y = monthly_sales, fill = CategoryName)) +
+  geom_col(position = "dodge") +
+  scale_x_discrete(limits = c("2018-01", "2018-02", "2018-03", "2018-04")) +
+  labs(title = "Monthly Sales by Category (Jan–Apr)", x = "Month", y = "Sales") +
+  theme_minimal() +
+  scale_fill_viridis_d()
+
+sales_full[, SalesMonth := as.Date(paste0(SalesMonth, "-01"))]
+# Top Products Trajectory
+top_products <- sales_full[
+  , .(total_sales = sum(TotalPrice)),
+  by = ProductName
+][order(-total_sales)][1:5, ProductName]|> as.character()
+
+product_monthly <- sales_full[
+  ProductName %in% top_products,
+  .(monthly_sales = sum(TotalPrice)),
+  by = .(ProductName, SalesMonth)
+]
+
+ggplot(product_monthly, aes(x = SalesMonth, y = monthly_sales, color = ProductName)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_viridis_d() +
+  labs(title = "Top 5 Products: Monthly Sales Trend", x = "Month", y = "Sales") +
+  theme_minimal()
+
+# Normalize to Baseline
+product_monthly <- product_monthly[order(SalesMonth)]
+product_monthly[, baseline := monthly_sales[1], by = ProductName]
+product_monthly <- product_monthly[!is.na(baseline) & baseline != 0]
+product_monthly[, index := monthly_sales / baseline]
+
+ggplot(product_monthly, aes(x = SalesMonth, y = index, color = ProductName)) +
+  geom_line(linewidth = 1.1) +
+  scale_color_viridis_d() +
+  labs(title = "Indexed Growth Since January (Top Products)", y = "Sales Index (Jan = 1)", x = "Month") +
+  theme_minimal() 
+
+# Category Monthly Trends
+monthly_category_mix <- sales_full[
+  , .(monthly_sales = sum(TotalPrice, na.rm = TRUE)),
+  by = .(SalesMonth, CategoryName)
+]
+
+ggplot(monthly_category_mix, aes(x = SalesMonth, y = monthly_sales, fill = CategoryName)) +
+  geom_area(position = "fill") +
+  scale_fill_viridis_d() +
+  labs(title = "Product Category Share Over Time", y = "Share of Monthly Sales", x = "Month") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal()
+
+# Top product per Month
+top_by_month <- sales_full[
+  , .(monthly_sales = sum(TotalPrice, na.rm = TRUE)),
+  by = .(ProductName, SalesMonth)
+][
+  , .SD[which.max(monthly_sales)], by = SalesMonth
+][order(-monthly_sales)]
+
+head(top_by_month)
+```
+
+Insights:
+
+* There is some variation over months with category popularity, but generally, produce stays the most in demand with beverages coming in second
+  * At no point do any two categories change positions
+* All top products follow the same sales trends we have seen previously from January through April
+* Bread (Calabrese Baguette) shows the most relative growth to it's competitors while still falling in the same trend line 
+* With very few dips, category share of sales over January-April stayed very consistent
+* Passion Fruit Puree was the top product for the months of January and March while Bread (Calabrese Baguette) was the top product the rest of the months 
+
+## 7. Forecasting
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+# Future Sales 
+# Prep Data
+sales_full <- as.data.table(sales_full)
+sales_full[, SalesDate := as.Date(SalesDate)]
+sales_full[, SalesMonth := floor_date(SalesDate, "month")]
+sales_full[, DayOfWeek := lubridate::wday(SalesDate, label = TRUE)]
+sales_full[, IsWeekend := ifelse(DayOfWeek %in% c("Sat", "Sun"), 1, 0)]
+
+# Aggregate by date 
+daily_sales <- sales_full[, .(
+  total_sales = sum(TotalPrice),
+  num_sales = .N,
+  city = first(CustomerCityName),      
+  category = first(CategoryName),      
+  day_of_week = first(DayOfWeek),
+  is_weekend = first(IsWeekend)
+), by = SalesDate]
+
+# Convert to tibble
+sales_tbl <- as_tibble(daily_sales) 
+
+sales_tbl <- sales_tbl %>%
+  arrange(SalesDate) %>%
+  mutate(MonthNum = as.integer(factor(floor_date(SalesDate, "month"))))
+
+
+# Use the first 3 months for training, last month for testing
+set.seed(123)
+split <- initial_time_split(sales_tbl, prop = 0.75)
+train_data <- training(split)
+test_data <- testing(split)
+
+
+# Recipe
+sales_recipe <- recipe(total_sales ~ MonthNum + city + category + day_of_week + is_weekend, data = train_data) %>%
+  step_unknown(day_of_week) %>%
+  step_novel(city, category) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv() %>%
+  step_normalize(all_numeric_predictors())
+
+#XGBoost
+xgb_model <- boost_tree(
+  mode = "regression",
+  trees = 500,
+  tree_depth = tune(6),
+  learn_rate = tune(0.1),
+  loss_reduction = tune(0)
+) %>%
+  set_engine("xgboost")
+
+# Workflow
+xgb_workflow <- workflow() %>%
+  add_model(xgb_model) %>%
+  add_recipe(sales_recipe)
+
+# Tune
+set.seed(123)
+xgb_res <- tune_grid(
+  xgb_workflow,
+  resamples = vfold_cv(train_data, v = 5),
+  grid = 10,
+  control = control_grid(save_pred = TRUE)
+)
+
+best_params <- select_best(xgb_res, metric = "rmse")
+final_xgb <- finalize_workflow(xgb_workflow, best_params)
+
+# Finalize
+final_fit <- fit(final_xgb, data = train_data)
+
+# Predict
+predictions <- predict(final_fit, test_data) %>%
+  bind_cols(test_data)
+
+# Future
+city_counts <- train_data %>%
+  count(city) %>%
+  arrange(desc(n))
+most_common_city <- city_counts$city[1]
+
+category_counts <- train_data %>%
+  count(category) %>%
+  arrange(desc(n))
+most_common_category <- category_counts$category[1]
+
+last_month_num <- max(train_data$MonthNum, na.rm = TRUE)
+if (is.na(last_month_num)) stop("MonthNum has NA values!")
+last_sales_month <- max(train_data$SalesDate, na.rm = TRUE)
+
+future_month_nums <- (last_month_num + 1):(last_month_num + 4)
+future_sales_months <- seq.Date(from = floor_date(last_sales_month, "month") %m+% months(1),
+                               by = "month",
+                               length.out = 4)
+future_sales_dates <- seq(from = last_sales_month %m+% months(1), by = "1 month", length.out = 4)
+
+day_levels <- levels(train_data$day_of_week)
+future_day_of_week <- factor(rep("Mon", 4), levels = day_levels)
+future_is_weekend <- 0
+
+future_day_of_week <- factor(rep("Mon", 4), 
+                             levels = levels(train_data$day_of_week), 
+                             ordered = TRUE)
+future_is_weekend <- rep(0, 4)
+
+future_data <- tibble(
+  MonthNum = future_month_nums,
+  SalesDate = future_sales_months,
+  city = most_common_city,
+  category = most_common_category,
+  day_of_week = future_day_of_week,
+  is_weekend = future_is_weekend
+)
+
+# Predict future sales
+future_predictions <- predict(final_fit, new_data = future_data) %>%
+  bind_cols(future_data)
+
+# Plot
+plot_data <- bind_rows(
+  train_data %>% mutate(type = "Actual"),
+  future_predictions %>% rename(total_sales = .pred) %>% mutate(type = "Forecast")
+)
+
+mean_actual_sales <- mean(train_data$total_sales, na.rm = TRUE)
+
+ggplot(plot_data, aes(x = SalesDate, y = total_sales, color = type)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = mean_actual_sales, linetype = "dashed", color = "blue") +
+  scale_color_manual(values = c("Actual" = "darkgrey", "Forecast" = "red")) +
+  labs(title = "Sales Forecast with XGBoost", y = "Total Sales", x = "Date") +
+  theme_minimal()
+
+#Customer segmentation using k-means or clustering
+# Prep Data
+customer_features <- sales_full[, .(
+  total_spent = sum(TotalPrice, na.rm = TRUE),
+  avg_spent = mean(TotalPrice, na.rm = TRUE),
+  total_items = sum(Quantity, na.rm = TRUE),
+  num_orders = .N,
+  unique_categories = uniqueN(CategoryID),
+  unique_products = uniqueN(ProductID)
+), by = CustomerID]
+customer_features_scaled <- as.data.table(scale(customer_features[, -1]))  # drop CustomerID
+customer_features_scaled[, CustomerID := customer_features$CustomerID]
+
+#  Subset for PCA & K-means
+set.seed(123)
+subset_data <- customer_features_scaled[sample(.N, min(10000, .N))]  # Take max 10K rows
+features_only <- subset_data[, !("CustomerID"), with = FALSE]
+
+# Run PCA
+pca <- prcomp(features_only, center = TRUE, scale. = TRUE)
+
+# Find #  of clusters
+fviz_nbclust(features_only, kmeans, method = "silhouette") +
+  labs(title = "Silhouette Method")
+
+# Run K-means 
+set.seed(123)
+k <- 2  # Adjust based on elbow/silhouette
+kmeans_result <- kmeans(pca$x[, 1:4], centers = k)
+
+# Attach clusters to data
+subset_data[, cluster := factor(kmeans_result$cluster)]
+
+# Plot PCA clusters
+viridis_colors <- viridis(k)
+fviz_cluster(
+  list(data = pca$x, cluster = kmeans_result$cluster),
+  geom = "point",
+  ellipse.type = "norm",
+  main = "Customer Segments",
+  palette = viridis_colors) +
+  theme_minimal()
+
+# Summarize
+subset_data[, cluster := factor(kmeans_result$cluster)]
+summary_by_cluster <- subset_data[, lapply(.SD, mean), by = cluster]
+print(summary_by_cluster)
+```
+
+Insights:
+
+* Forecast for sales after April evens out around the $34,125,000 sales mark
+  * This about $250,000 lower than the mean of the previous 4 months
+* Inspecting Customers and how they are segmented, they do overlap but have some key differences
+  * Cluster 1 spends less than Cluster 2
+  * Cluster 1 has a lower average transaction value per purchase
+  * Cluster 1 makes less transactions
+  * Cluster 1 includes less unique products per transaction, they have more of the same product per transaction
+  * Cluster 1 includes less product category variation in their purchases
+
+
+# Conclusion
+
+Going forward and looking to increase sales:
+
+* Possibly invest more money in Produce, Grain and Beverage categories as these are the most profitable
+  * This could be through selling more unique products in these categories, or having more of these products in stock
+* Either decrease investments in Poultry, Shellfish and Cereal or increase advertising and marketability of these items to increase sales in these categories
+* Since basket size and high priced items can increase total amount spend, researching marketing techniques to customers to increase both of these
+  * Placing high priced items that "go together" in the store to create a customer's basket making it easier for them to easily purchase those items
+* Employees effects sales, with those older and more tenured performing better
+  * Researching ways to create better training programs at low cost may improve performance
+  * High performing salespeople may indicate incentives through promotion or salary increases
+* There are 2 customer groups:
+  * The ideal customer: High spender, shop often, purchase multiple items, purchases across multiple unique categories and products
+  * The less ideal customer: cost saver, shop rarely, purchase few items, purchases stay in limited categories and products
+    * It's important to understand both types of customers as both their sales matter and research more how to market to both of them to increase sales
+* Looking at the current sales trend, without making any changes, we will likely see a dip in sales over the next few months in comparison to where sales has been sitting
+  * This is based one what we have already seen, however with advertising and icnreased employee training tactics, this could change
